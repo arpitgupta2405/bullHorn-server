@@ -214,8 +214,8 @@ curl "http://localhost:3000/rest-services/{corpToken}/entity/Candidate/1?BhRestT
 ```json
 {
   "data": {
-    "firstName": "John",
-    "lastName": "Doe",
+  "firstName": "John",
+  "lastName": "Doe",
     "address": {
       "address1": "123 Main St",
       "city": "Boston",
@@ -288,7 +288,20 @@ curl -X POST "http://localhost:3000/rest-services/login?version=*&access_token={
 | OAUTH_CLIENT_SECRET | OAuth client secret | bullhorn_client_secret_123 |
 | OAUTH_USERNAME | Test username | bullhorn_user |
 | OAUTH_PASSWORD | Test password | bullhorn_pass_456 |
-| OAUTH_REDIRECT_URI | Default redirect URI | https://staging.integrator.io/connection/oauth2callback |
+| OAUTH_REDIRECT_URIS | Comma-separated list of allowed redirect URIs (required outside test mode) | *(none; must be provided for production)* |
+| BULLHORN_TEST_MODE | Set to `true` to relax redirect checks (used by automated tests) | *(unset)* |
+
+### Test vs. Production Modes
+
+- **Test Mode (`BULLHORN_TEST_MODE=true`)**
+  - `redirect_uri` is optional when calling `/oauth/authorize`
+  - Any provided `redirect_uri` is accepted (logged with a warning if not in the allowed list)
+  - Designed for automated/local workflows where interactive redirects are impractical
+
+- **Production Mode (default when `BULLHORN_TEST_MODE` is unset/false)**
+  - `redirect_uri` **must** be present on every `/oauth/authorize` call
+  - The value must match one of the entries configured via `OAUTH_REDIRECT_URIS`
+  - Missing or unregistered redirect URIs result in an `invalid_request` error, matching Bullhorn's enforcement
 
 ## Token Expiration
 
@@ -330,6 +343,7 @@ npm test
 4. **PUT for Create**: Bullhorn uses PUT (not POST) to create entities
 5. **POST for Update**: Bullhorn uses POST (not PUT) to update entities
 6. **BhRestToken**: API calls use `BhRestToken` query parameter, not Bearer token header
+7. **Redirect Validation**: Outside of test mode the `redirect_uri` parameter must be supplied and match one of the configured `OAUTH_REDIRECT_URIS`.
 
 ## References
 
@@ -338,4 +352,4 @@ npm test
 
 ## License
 
-MIT
+MIT 

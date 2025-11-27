@@ -16,7 +16,20 @@ const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'bullhorn_client_123';
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || 'bullhorn_client_secret_123';
 const OAUTH_USERNAME = process.env.OAUTH_USERNAME || 'bullhorn_user';
 const OAUTH_PASSWORD = process.env.OAUTH_PASSWORD || 'bullhorn_pass_456';
-const DEFAULT_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || 'https://staging.integrator.io/connection/oauth2callback';
+
+const rawRedirectUris =
+  process.env.OAUTH_REDIRECT_URIS ??
+  process.env.OAUTH_REDIRECT_URI ??
+  '';
+const CONFIGURED_REDIRECT_URIS = rawRedirectUris
+  .split(',')
+  .map(uri => uri.trim())
+  .filter(Boolean);
+
+let isTestMode =
+  process.env.BULLHORN_TEST_MODE === 'true' ||
+  process.env.NODE_ENV === 'test' ||
+  process.env.NODE_TEST_CONTEXT === '1';
 
 // Simulated data center configuration (like Bullhorn's multi-datacenter setup)
 const DATA_CENTER = 'east'; // Simulates regional data center
@@ -39,11 +52,27 @@ const dataStore = {
   accessTokens: new Map(), // stores { token: { userId, expiresAt, refreshToken } }
   refreshTokens: new Map(), // stores { token: { userId, createdAt } }
   authorizationCodes: new Map(), // stores { code: { expiresAt, clientId, userId, redirectUri } }
-  registeredRedirectUris: new Set([DEFAULT_REDIRECT_URI]), // Registered redirect URIs for the OAuth app
+  registeredRedirectUris: new Set(CONFIGURED_REDIRECT_URIS), // Registered redirect URIs for the OAuth app
   debug: {
     refreshTokenCount: 0
   }
 };
+
+function setTestMode(value) {
+  isTestMode = Boolean(value);
+}
+
+function setRedirectUris(uris) {
+  dataStore.registeredRedirectUris = new Set(uris);
+}
+
+function resetRedirectUris() {
+  dataStore.registeredRedirectUris = new Set(CONFIGURED_REDIRECT_URIS);
+}
+
+function getRegisteredRedirectUris() {
+  return Array.from(dataStore.registeredRedirectUris);
+}
 
 // Token generation functions
 function generateAccessToken() {
@@ -234,11 +263,37 @@ app.get('/oauth/authorize', (req, res) => {
     });
   }
 
-  // Validate redirect_uri if provided (must match registered URIs)
-  const effectiveRedirectUri = redirect_uri || DEFAULT_REDIRECT_URI;
-  if (redirect_uri && !dataStore.registeredRedirectUris.has(redirect_uri)) {
-    // For testing purposes, we'll accept any redirect_uri but log a warning
-    console.warn(`Warning: redirect_uri "${redirect_uri}" not in registered URIs. Allowing for testing.`);
+  // Validate redirect_uri (required outside test mode)
+  if (!redirect_uri && !isTestMode) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'redirect_uri parameter is required outside of test mode'
+    });
+  }
+
+  const effectiveRedirectUri = redirect_uri || null;
+  if (effectiveRedirectUri) {
+    const registeredUris = dataStore.registeredRedirectUris;
+
+    if (registeredUris.size === 0 && !isTestMode) {
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'No redirect URIs are configured on the server'
+      });
+    }
+
+    if (registeredUris.size > 0 && !registeredUris.has(effectiveRedirectUri)) {
+      if (isTestMode) {
+        console.warn(
+          `Warning: redirect_uri "${effectiveRedirectUri}" not in registered URIs. Allowing because server is running in test mode.`
+        );
+      } else {
+        return res.status(400).json({
+          error: 'invalid_request',
+          error_description: 'redirect_uri is not registered with this server'
+        });
+      }
+    }
   }
 
   // If action=Login is provided with credentials, authenticate directly
@@ -278,16 +333,25 @@ app.get('/oauth/authorize', (req, res) => {
       redirectUri: effectiveRedirectUri
     });
 
-    // Build redirect URL with authorization code and state
-    const redirectUrl = new URL(effectiveRedirectUri);
-    redirectUrl.searchParams.append('code', authorizationCode);
-    
-    if (state) {
-      redirectUrl.searchParams.append('state', state);
+    if (effectiveRedirectUri) {
+      // Build redirect URL with authorization code and state
+      const redirectUrl = new URL(effectiveRedirectUri);
+      redirectUrl.searchParams.append('code', authorizationCode);
+      
+      if (state) {
+        redirectUrl.searchParams.append('state', state);
+      }
+
+      // Redirect to the redirect_uri with the authorization code
+      return res.redirect(redirectUrl.toString());
     }
 
-    // Redirect to the redirect_uri with the authorization code
-    return res.redirect(redirectUrl.toString());
+    // If no redirect_uri was provided (test mode), return the code in the response body
+    const payload = { code: authorizationCode };
+    if (state) {
+      payload.state = state;
+    }
+    return res.status(200).json(payload);
   }
 
   // If no action=Login, would normally show login page
@@ -297,6 +361,122 @@ app.get('/oauth/authorize', (req, res) => {
     error_description: 'action=Login with username and password required for programmatic access. Otherwise, a login page would be displayed.'
   });
 });
+
+function issueTokenPair(userId, existingRefreshToken) {
+    const now = Date.now();
+  const accessToken = generateAccessToken();
+  const refreshToken = existingRefreshToken || generateRefreshToken();
+    const expiresAt = now + ACCESS_TOKEN_EXPIRES_IN;
+
+    dataStore.accessTokens.set(accessToken, {
+    userId,
+    expiresAt,
+    refreshToken
+  });
+
+  if (existingRefreshToken) {
+    const refreshTokenData = dataStore.refreshTokens.get(existingRefreshToken);
+    if (refreshTokenData) {
+      refreshTokenData.accessToken = accessToken;
+      refreshTokenData.createdAt = now;
+    }
+  } else {
+    dataStore.refreshTokens.set(refreshToken, {
+      userId,
+      createdAt: now,
+      accessToken
+    });
+  }
+
+  return { accessToken, refreshToken };
+}
+
+function handleAuthorizationCodeGrant(params, res) {
+  if (!params.code) {
+    return res.status(400).json({
+        error: 'invalid_request',
+      error_description: 'Missing code parameter'
+    });
+  }
+
+  const codeData = dataStore.authorizationCodes.get(params.code);
+
+  if (!codeData) {
+    return res.status(400).json({
+        error: 'invalid_grant',
+      error_description: 'Invalid authorization code'
+    });
+  }
+
+  if (isTokenExpired(codeData.expiresAt)) {
+    dataStore.authorizationCodes.delete(params.code);
+    return res.status(400).json({
+        error: 'invalid_grant',
+      error_description: 'Authorization code expired'
+    });
+  }
+
+  if (codeData.clientId !== params.client_id) {
+    return res.status(400).json({
+      error: 'invalid_grant',
+      error_description: 'Authorization code was issued to a different client'
+    });
+  }
+
+  if (codeData.redirectUri && params.redirect_uri && params.redirect_uri !== codeData.redirectUri) {
+    return res.status(400).json({
+      error: 'invalid_grant',
+      error_description: 'redirect_uri does not match the one used in authorization request'
+    });
+  }
+
+  const { accessToken, refreshToken } = issueTokenPair(codeData.userId);
+
+  dataStore.authorizationCodes.delete(params.code);
+
+  return res.status(200).json({
+        access_token: accessToken,
+        token_type: 'Bearer',
+    expires_in: Math.floor(ACCESS_TOKEN_EXPIRES_IN / 1000),
+    refresh_token: refreshToken
+  });
+}
+
+function handleRefreshTokenGrant(params, res) {
+  if (!params.refresh_token) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'Missing refresh_token parameter'
+    });
+  }
+
+  const refreshTokenData = dataStore.refreshTokens.get(params.refresh_token);
+  if (!refreshTokenData) {
+    return res.status(400).json({
+      error: 'invalid_grant',
+      error_description: 'Invalid refresh token'
+    });
+  }
+
+  const newTokens = issueTokenPair(refreshTokenData.userId);
+
+  dataStore.refreshTokens.delete(params.refresh_token);
+  dataStore.refreshTokens.set(newTokens.refreshToken, {
+    userId: refreshTokenData.userId,
+    createdAt: Date.now(),
+    accessToken: newTokens.accessToken
+  });
+
+  dataStore.debug.refreshTokenCount += 1;
+  console.log(`logName=refreshToken, token=${newTokens.accessToken}, count=${dataStore.debug.refreshTokenCount}`);
+
+  return res.status(200).json({
+    access_token: newTokens.accessToken,
+    token_type: 'Bearer',
+    expires_in: Math.floor(ACCESS_TOKEN_EXPIRES_IN / 1000),
+    refresh_token: newTokens.refreshToken
+  });
+}
 
 // =====================================================
 // OAUTH TOKEN ENDPOINT
@@ -332,136 +512,12 @@ app.post('/oauth/token', (req, res) => {
 
   // Handle authorization code flow
   if (params.grant_type === 'authorization_code') {
-    if (!params.code) {
-      return res.status(400).json({
-        error: 'invalid_request',
-        error_description: 'Missing code parameter'
-      });
-    }
-
-    // Validate authorization code
-    const codeData = dataStore.authorizationCodes.get(params.code);
-    
-    if (!codeData) {
-      return res.status(400).json({
-        error: 'invalid_grant',
-        error_description: 'Invalid authorization code'
-      });
-    }
-
-    // Check if authorization code is expired
-    if (isTokenExpired(codeData.expiresAt)) {
-      dataStore.authorizationCodes.delete(params.code);
-      return res.status(400).json({
-        error: 'invalid_grant',
-        error_description: 'Authorization code expired'
-      });
-    }
-
-    // Check if client_id matches
-    if (codeData.clientId !== params.client_id) {
-      return res.status(400).json({
-        error: 'invalid_grant',
-        error_description: 'Authorization code was issued to a different client'
-      });
-    }
-
-    // Check if redirect_uri matches (if provided in token request)
-    if (params.redirect_uri && params.redirect_uri !== codeData.redirectUri) {
-      return res.status(400).json({
-        error: 'invalid_grant',
-        error_description: 'redirect_uri does not match the one used in authorization request'
-      });
-    }
-
-    // Generate new tokens
-    const accessToken = generateAccessToken();
-    const refreshToken = generateRefreshToken();
-    const userId = codeData.userId;
-    const now = Date.now();
-    const expiresAt = now + ACCESS_TOKEN_EXPIRES_IN;
-
-    // Store tokens
-    dataStore.accessTokens.set(accessToken, {
-      userId: userId,
-      expiresAt: expiresAt,
-      refreshToken: refreshToken
-    });
-
-    dataStore.refreshTokens.set(refreshToken, {
-      userId: userId,
-      createdAt: now,
-      accessToken: accessToken
-    });
-
-    // Clear the authorization code (one-time use)
-    dataStore.authorizationCodes.delete(params.code);
-
-    // Return Bullhorn-style token response
-    return res.status(200).json({
-      access_token: accessToken,
-      token_type: 'Bearer',
-      expires_in: Math.floor(ACCESS_TOKEN_EXPIRES_IN / 1000), // 600 seconds (10 minutes)
-      refresh_token: refreshToken
-    });
+    return handleAuthorizationCodeGrant(params, res);
   }
 
   // Handle refresh token flow
   if (params.grant_type === 'refresh_token') {
-    dataStore.debug.refreshTokenCount++;
-    
-    if (!params.refresh_token) {
-      return res.status(400).json({
-        error: 'invalid_request',
-        error_description: 'Missing refresh_token parameter'
-      });
-    }
-
-    // Validate refresh token
-    const refreshTokenData = dataStore.refreshTokens.get(params.refresh_token);
-    if (!refreshTokenData) {
-      return res.status(400).json({
-        error: 'invalid_grant',
-        error_description: 'Invalid refresh token'
-      });
-    }
-
-    // Revoke old access token if it exists
-    if (refreshTokenData.accessToken) {
-      dataStore.accessTokens.delete(refreshTokenData.accessToken);
-    }
-
-    // Generate new access token (and new refresh token - Bullhorn returns new refresh token each time)
-    const newAccessToken = generateAccessToken();
-    const newRefreshToken = generateRefreshToken();
-    const userId = refreshTokenData.userId;
-    const now = Date.now();
-    const expiresAt = now + ACCESS_TOKEN_EXPIRES_IN;
-
-    console.log(`logName=refreshToken, token=${newAccessToken}, count=${dataStore.debug.refreshTokenCount}`);
-
-    // Store new access token
-    dataStore.accessTokens.set(newAccessToken, {
-      userId: userId,
-      expiresAt: expiresAt,
-      refreshToken: newRefreshToken
-    });
-
-    // Delete old refresh token and store new one
-    dataStore.refreshTokens.delete(params.refresh_token);
-    dataStore.refreshTokens.set(newRefreshToken, {
-        userId: userId,
-        createdAt: now,
-      accessToken: newAccessToken
-    });
-
-    // Return new tokens (Bullhorn returns new refresh token with every access token)
-    return res.status(200).json({
-      access_token: newAccessToken,
-        token_type: 'Bearer',
-      expires_in: Math.floor(ACCESS_TOKEN_EXPIRES_IN / 1000),
-      refresh_token: newRefreshToken
-      });
+    return handleRefreshTokenGrant(params, res);
   }
 
   // Unsupported grant type
@@ -497,9 +553,9 @@ app.post('/rest-services/login', (req, res) => {
     });
   }
 
-  // Check if access token is expired
-  if (isTokenExpired(tokenData.expiresAt)) {
-    dataStore.accessTokens.delete(accessToken);
+    // Check if access token is expired
+    if (isTokenExpired(tokenData.expiresAt)) {
+      dataStore.accessTokens.delete(accessToken);
     return res.status(401).json({ 
       errorMessage: 'Access token expired. Use refresh token to get a new access token.',
       errorCode: 'ACCESS_TOKEN_EXPIRED'
@@ -1061,24 +1117,27 @@ function initializeSampleData() {
 if (require.main === module) {
   app.listen(PORT, () => {
     initializeSampleData();
-    
-    // Start periodic cleanup of expired tokens (every 5 minutes)
     setInterval(cleanupExpiredTokens, 5 * 60 * 1000);
-    
-    console.log(`\n🚀 BullHorn Mock Server running on port ${PORT}`);
+
+    console.log(`
+🚀 BullHorn Mock Server running on port ${PORT}`);
     console.log(`   Data Center: ${DATA_CENTER}`);
-    console.log(`\n📋 API Endpoints:`);
+    console.log(`
+📋 API Endpoints:`);
     console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`\n🔐 OAuth Flow (following Bullhorn's actual process):`);
+    console.log(`
+🔐 OAuth Flow (following Bullhorn's actual process):`);
     console.log(`   1. Login Info:     GET  http://localhost:${PORT}/rest-services/loginInfo?username={username}`);
     console.log(`   2. Authorization:  GET  http://localhost:${PORT}/oauth/authorize?client_id=...&response_type=code&action=Login&username=...&password=...`);
     console.log(`   3. Get Token:      POST http://localhost:${PORT}/oauth/token (grant_type=authorization_code)`);
     console.log(`   4. Refresh Token:  POST http://localhost:${PORT}/oauth/token (grant_type=refresh_token)`);
     console.log(`   5. REST Login:     POST http://localhost:${PORT}/rest-services/login?version=*&access_token={token}`);
-    console.log(`\n📚 REST API (after login):`);
+    console.log(`
+📚 REST API (after login):`);
     console.log(`   Base URL: http://localhost:${PORT}/rest-services/{corpToken}/`);
     console.log(`   Example:  GET  /rest-services/{corpToken}/entity/Candidate?BhRestToken={token}&fields=firstName,lastName`);
-    console.log(`\n🔑 Test Credentials:`);
+    console.log(`
+🔑 Test Credentials:`);
     console.log(`   client_id:     ${OAUTH_CLIENT_ID}`);
     console.log(`   client_secret: ${OAUTH_CLIENT_SECRET}`);
     console.log(`   username:      ${OAUTH_USERNAME}`);
@@ -1086,8 +1145,12 @@ if (require.main === module) {
     console.log('');
   });
 } else {
-  // Initialize data when imported for testing
   initializeSampleData();
 }
 
-module.exports = app; 
+app.__setTestMode = setTestMode;
+app.__setRedirectUris = setRedirectUris;
+app.__resetRedirectUris = resetRedirectUris;
+app.__getRegisteredRedirectUris = getRegisteredRedirectUris;
+
+module.exports = app;

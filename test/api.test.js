@@ -1,7 +1,11 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 const request = require('supertest');
-const app = require('../server');
+
+// Ensure server runs in test mode for redirect handling differences
+process.env.BULLHORN_TEST_MODE = 'true';
+
+let app = require('../server');
 
 // Helper to extract parameters from redirect URL
 function parseRedirectUrl(location) {
@@ -216,6 +220,76 @@ test('BullHorn Mock Server Rigorous Tests', async (t) => {
 
       assert.strictEqual(response.status, 400);
       assert.strictEqual(response.body.error, 'invalid_grant');
+    });
+
+    await t.test('1b.4 authorize without redirect returns code payload', async () => {
+      const response = await request(app)
+        .get('/oauth/authorize')
+        .query({
+          client_id: 'bullhorn_client_123',
+          response_type: 'code',
+          action: 'Login',
+          username: 'bullhorn_user',
+          password: 'bullhorn_pass_456',
+          state: 'no_redirect_state'
+        });
+
+      assert.strictEqual(response.status, 200);
+      assert.ok(response.body.code);
+      assert.strictEqual(response.body.state, 'no_redirect_state');
+    });
+
+    await t.test('1b.5 production mode enforces redirect validation', async () => {
+      const originalRedirects = app.__getRegisteredRedirectUris();
+      try {
+        app.__setTestMode(false);
+        app.__setRedirectUris([
+          'https://prod.example.com/callback',
+          'https://qa.example.com/callback'
+        ]);
+
+        const missingRedirect = await request(app)
+          .get('/oauth/authorize')
+          .query({
+            client_id: 'bullhorn_client_123',
+            response_type: 'code',
+            action: 'Login',
+            username: 'bullhorn_user',
+            password: 'bullhorn_pass_456'
+          });
+        assert.strictEqual(missingRedirect.status, 400);
+        assert.strictEqual(missingRedirect.body.error, 'invalid_request');
+
+        const invalidRedirect = await request(app)
+          .get('/oauth/authorize')
+          .query({
+            client_id: 'bullhorn_client_123',
+            response_type: 'code',
+            action: 'Login',
+            username: 'bullhorn_user',
+            password: 'bullhorn_pass_456',
+            redirect_uri: 'https://evil.example.com/callback'
+          });
+        assert.strictEqual(invalidRedirect.status, 400);
+        assert.strictEqual(invalidRedirect.body.error, 'invalid_request');
+
+        const validRedirect = await request(app)
+          .get('/oauth/authorize')
+          .query({
+            client_id: 'bullhorn_client_123',
+            response_type: 'code',
+            action: 'Login',
+            username: 'bullhorn_user',
+            password: 'bullhorn_pass_456',
+            redirect_uri: 'https://prod.example.com/callback',
+            state: 'prod_state'
+          });
+        assert.strictEqual(validRedirect.status, 302);
+        assert.ok(validRedirect.headers.location.includes('prod_state'));
+      } finally {
+        app.__setTestMode(true);
+        app.__setRedirectUris(originalRedirects);
+      }
     });
   });
 
